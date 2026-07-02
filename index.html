@@ -528,7 +528,7 @@ const DEFAULT_DB={
     {id:'r4',icon:'🍽️',name:'Nice dinner / day trip',cost:40,tier:'long',claimed:0}
   ],
   plan:{}, weeksGenerated:{},
-  sync:{clientId:'',direction:'both',calendarId:'primary',lastSync:null,map:{}},
+  sync:{clientId:'',direction:'both',calendarId:'primary',pullCalendars:['primary'],availableCalendars:[],lastSync:null,map:{}},
   externalEvents:{}
 };
 let DB=load();
@@ -639,7 +639,7 @@ async function connectCalendar(){
           gAccessToken=resp.access_token;
           renderSyncUI();
           toast('🔗 Connected to Google Calendar','');
-          syncNow();
+          refreshCalendarList().then(()=>syncNow());
         }
       });
     }
@@ -648,10 +648,28 @@ async function connectCalendar(){
 }
 function disconnectCalendar(){ gAccessToken=null; renderSyncUI(); toast('Disconnected',''); }
 function setSyncDirection(dir){ DB.sync.direction=dir; save(); renderSyncUI(); if(gAccessToken) syncNow(); }
+function toggleCalendarPull(id){
+  DB.sync.pullCalendars=DB.sync.pullCalendars||['primary'];
+  const i=DB.sync.pullCalendars.indexOf(id);
+  if(i>=0) DB.sync.pullCalendars.splice(i,1); else DB.sync.pullCalendars.push(id);
+  save(); renderSyncUI();
+  if(gAccessToken) syncNow();
+}
+async function refreshCalendarList(){
+  if(!gAccessToken)return;
+  try{
+    const res=await fetch('https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=250',{headers:{Authorization:'Bearer '+gAccessToken}});
+    if(!res.ok) throw new Error('status '+res.status);
+    const data=await res.json();
+    DB.sync.availableCalendars=(data.items||[]).map(c=>({id:c.id,name:c.summaryOverride||c.summary||c.id,primary:!!c.primary}));
+    save(); renderSyncUI();
+  }catch(e){ toast('Could not load your calendar list',''); }
+}
 
-async function gcalFetch(path,opts){
+async function gcalFetch(path,opts,calendarId){
   opts=opts||{};
-  const res=await fetch('https://www.googleapis.com/calendar/v3/calendars/'+encodeURIComponent(DB.sync.calendarId||'primary')+path,
+  const cid=calendarId||DB.sync.calendarId||'primary';
+  const res=await fetch('https://www.googleapis.com/calendar/v3/calendars/'+encodeURIComponent(cid)+path,
     Object.assign({},opts,{headers:Object.assign({Authorization:'Bearer '+gAccessToken,'Content-Type':'application/json'},opts.headers||{})}));
   if(res.status===401){ gAccessToken=null; renderSyncUI(); throw new Error('Session expired — reconnect'); }
   if(!res.ok) throw new Error('Google Calendar request failed ('+res.status+')');
@@ -704,38 +722,44 @@ async function pushToCalendar(){
 async function pullFromCalendar(){
   const timeMin=new Date(); timeMin.setHours(0,0,0,0);
   const timeMax=new Date(timeMin); timeMax.setDate(timeMax.getDate()+30);
-  const data=await gcalFetch('/events?timeMin='+encodeURIComponent(timeMin.toISOString())+'&timeMax='+encodeURIComponent(timeMax.toISOString())+'&singleEvents=true&orderBy=startTime&maxResults=250');
+  const qs='/events?timeMin='+encodeURIComponent(timeMin.toISOString())+'&timeMax='+encodeURIComponent(timeMax.toISOString())+'&singleEvents=true&orderBy=startTime&maxResults=250';
+  const cids=(DB.sync.pullCalendars&&DB.sync.pullCalendars.length)?DB.sync.pullCalendars:['primary'];
   const fresh={}; let pulled=0;
-  (data.items||[]).forEach(ev=>{
-    const props=ev.extendedProperties&&ev.extendedProperties.private;
-    if(props&&props.dqSource==='day-quest')return; // our own pushed event — skip, avoids echo loop
-    if(!ev.start)return;
-    const allDay=!ev.start.dateTime;
-    const startDt=new Date(ev.start.dateTime||ev.start.date+'T00:00:00');
-    const endDt=ev.end?new Date(ev.end.dateTime||ev.end.date+'T00:00:00'):new Date(startDt.getTime()+3600000);
-    const title=ev.summary||'(untitled)';
-    // Multi-day events (spans past midnight, or a true all-day event) render as a
-    // banner on every day they touch instead of one giant/hidden block on the start day.
-    const spansDays = allDay ? (dkey(endDt)!==dkey(startDt)) : ((endDt-startDt)>20*3600000 || dkey(endDt)!==dkey(startDt));
-    if(spansDays){
-      let cur=new Date(startDt.getFullYear(),startDt.getMonth(),startDt.getDate());
-      let last=new Date(endDt.getFullYear(),endDt.getMonth(),endDt.getDate());
-      if(allDay) last.setDate(last.getDate()-1); // all-day end dates are exclusive per spec
-      let guard=0;
-      while(cur<=last&&guard<21){
-        const dk=dkey(cur);
-        fresh[dk]=fresh[dk]||[];
-        fresh[dk].push({id:'g_'+ev.id+'_'+dk,title,start:'00:00',mins:0,banner:true,source:'google'});
-        cur.setDate(cur.getDate()+1); guard++;
+  for(const cid of cids){
+    let data;
+    try{ data=await gcalFetch(qs,{},cid); } catch(e){ continue; } // skip a calendar that fails rather than aborting the whole sync
+    (data.items||[]).forEach(ev=>{
+      const props=ev.extendedProperties&&ev.extendedProperties.private;
+      if(props&&props.dqSource==='day-quest')return; // our own pushed event — skip, avoids echo loop
+      if(!ev.start)return;
+      const allDay=!ev.start.dateTime;
+      const startDt=new Date(ev.start.dateTime||ev.start.date+'T00:00:00');
+      const endDt=ev.end?new Date(ev.end.dateTime||ev.end.date+'T00:00:00'):new Date(startDt.getTime()+3600000);
+      const title=ev.summary||'(untitled)';
+      const eid='g_'+cid+'_'+ev.id;
+      // Multi-day events (spans past midnight, or a true all-day event) render as a
+      // banner on every day they touch instead of one giant/hidden block on the start day.
+      const spansDays = allDay ? (dkey(endDt)!==dkey(startDt)) : ((endDt-startDt)>20*3600000 || dkey(endDt)!==dkey(startDt));
+      if(spansDays){
+        let cur=new Date(startDt.getFullYear(),startDt.getMonth(),startDt.getDate());
+        let last=new Date(endDt.getFullYear(),endDt.getMonth(),endDt.getDate());
+        if(allDay) last.setDate(last.getDate()-1); // all-day end dates are exclusive per spec
+        let guard=0;
+        while(cur<=last&&guard<21){
+          const dk=dkey(cur);
+          fresh[dk]=fresh[dk]||[];
+          fresh[dk].push({id:eid+'_'+dk,title,start:'00:00',mins:0,banner:true,source:'google'});
+          cur.setDate(cur.getDate()+1); guard++;
+        }
+      } else {
+        const k=dkey(startDt);
+        const mins=Math.max(10,Math.round((endDt-startDt)/60000));
+        fresh[k]=fresh[k]||[];
+        fresh[k].push({id:eid,title,start:minToHHMM(startDt.getHours()*60+startDt.getMinutes()),mins,banner:false,source:'google'});
       }
-    } else {
-      const k=dkey(startDt);
-      const mins=Math.max(10,Math.round((endDt-startDt)/60000));
-      fresh[k]=fresh[k]||[];
-      fresh[k].push({id:'g_'+ev.id,title,start:minToHHMM(startDt.getHours()*60+startDt.getMinutes()),mins,banner:false,source:'google'});
-    }
-    pulled++;
-  });
+      pulled++;
+    });
+  }
   DB.externalEvents=fresh; save();
   return pulled;
 }
@@ -787,11 +811,31 @@ function renderSyncUI(){
       <button class="restbtn ${s.direction==='both'?'on':''}" onclick="setSyncDirection('both')">🔁 Both ways</button>
       <button class="restbtn ${s.direction==='toCalendar'?'on':''}" onclick="setSyncDirection('toCalendar')">📤 Day Quest → Calendar</button>
     </div>
+    ${(s.direction==='toDayQuest'||s.direction==='both')?calendarPickerHTML(s):''}
     <div class="row" style="margin-top:12px;align-items:center">
       <button class="btn green sm" style="flex:0 0 auto" ${connected&&!gSyncing?'':'disabled'} onclick="syncNow()">${gSyncing?'Syncing…':'🔄 Sync now'}</button>
       <div class="psub" style="flex:1">Last synced: ${last}</div>
     </div>
     <div class="wellsub" style="margin-top:10px;font-size:11px">Since this app has no server, reconnect after closing the app for a while — each sync pulls the next 30 days and pushes anchors + upcoming sessions.</div>`;
+}
+function calendarPickerHTML(s){
+  const cals=s.availableCalendars||[];
+  const pull=s.pullCalendars||['primary'];
+  if(!gAccessToken){
+    return `<div class="wslot-t" style="margin:14px 0 8px">Calendars to pull from</div>
+      <div class="wellsub" style="margin:0">Connect first to choose which of your calendars (e.g. a shared family calendar) to pull events from — "primary" alone only reads your own default calendar.</div>`;
+  }
+  if(!cals.length){
+    return `<div class="wslot-t" style="margin:14px 0 8px">Calendars to pull from</div>
+      <button class="btn ghost sm block" onclick="refreshCalendarList()">📋 Load my calendars</button>`;
+  }
+  return `<div class="wslot-t" style="margin:14px 0 8px">Calendars to pull from <button class="mini" style="margin-left:6px" onclick="refreshCalendarList()">↻ refresh</button></div>
+    <div class="wslot" style="padding:6px 10px">
+      ${cals.map(c=>`<label style="display:flex;align-items:center;gap:9px;padding:7px 2px;font-size:13px;font-weight:600">
+        <input type="checkbox" ${pull.includes(c.id)?'checked':''} onchange="toggleCalendarPull('${esc(c.id).replace(/'/g,"\\'")}')" style="width:17px;height:17px;accent-color:var(--dia)">
+        ${esc(c.name)}${c.primary?' <span class="tag" style="margin-left:2px">default</span>':''}
+      </label>`).join('')}
+    </div>`;
 }
 
 function exportBackup(){
