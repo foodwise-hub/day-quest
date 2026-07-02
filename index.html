@@ -395,7 +395,7 @@
     <div id="questList"></div>
     <details class="adder" open><summary>+ New quest</summary>
       <div class="adderbox">
-        <div class="row"><div class="field" style="flex:2"><label>Quest name</label><input type="text" id="qName" placeholder="e.g. Blobwise"></div>
+        <div class="row"><div class="field" style="flex:2"><label>Quest name</label><input type="text" id="qName" placeholder="e.g. Side project"></div>
           <div class="field"><label>Color</label><input type="color" id="qColor" value="#4ecdc4" style="height:38px;padding:3px"></div></div>
         <div class="row"><div class="field"><label>Sessions / week</label><input type="number" id="qFreq" value="3" min="1" max="7"></div>
           <div class="field"><label>Mins / session</label><input type="number" id="qMins" value="60" min="10" step="5"></div>
@@ -410,7 +410,7 @@
     <div id="anchorList"></div>
     <details class="adder" open><summary>+ New anchor</summary>
       <div class="adderbox">
-        <div class="field"><label>What</label><input type="text" id="aTitle" placeholder="e.g. Liv camp pickup"></div>
+        <div class="field"><label>What</label><input type="text" id="aTitle" placeholder="e.g. School pickup"></div>
         <div class="field"><label>Days</label><div class="row" id="aDays" style="gap:6px">
           <button type="button" class="mini daytog" data-d="1">Mon</button><button type="button" class="mini daytog" data-d="2">Tue</button>
           <button type="button" class="mini daytog" data-d="3">Wed</button><button type="button" class="mini daytog" data-d="4">Thu</button>
@@ -500,17 +500,13 @@ const DEFAULT_DB={
   wellness:{},wellnessCount:0,
   stats:{work:0,move:0,mind:0,nourish:0,rest:0,connect:0},
   avatarLooks:{head:null,face:null,aura:null},avatarAuto:true,avatarOwned:[],previewAll:false,
-  quests:[
-    {id:'q1',name:'Blobwise',color:'#6fcf7f',freq:3,mins:60,time:'20:00'},
-    {id:'q2',name:'World Cup guide',color:'#f4b740',freq:2,mins:30,time:'21:00'},
-    {id:'q3',name:'Food Whiz',color:'#c084fc',freq:2,mins:45,time:'20:30'}
-  ],
+  quests:[],
   cards:[
     {id:'c1',name:'Deep work',color:'#7fc4e0',mins:90},
     {id:'c2',name:'Email / admin',color:'#9aa0b5',mins:30},
     {id:'c3',name:'Workout',color:'#e9a06f',mins:45}
   ],
-  anchors:[{id:'a1',title:'Liv camp pickup',days:[1,2,3,4,5],start:'16:00',mins:30,type:'anchor'}],
+  anchors:[],
   rewards:[
     {id:'r1',icon:'☕',name:'Guilt-free coffee + pastry run',cost:60,tier:'short',claimed:0},
     {id:'r2',icon:'📺',name:'An episode, no guilt',cost:50,tier:'short',claimed:0},
