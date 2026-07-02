@@ -12,6 +12,7 @@
 <meta name="apple-mobile-web-app-title" content="Day Quest">
 <link rel="apple-touch-icon" href="icon-192.png">
 <link rel="icon" href="icon-192.png">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=Inter:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
@@ -130,6 +131,9 @@
   .hline{position:absolute;left:0;right:0;height:1px;pointer-events:none;z-index:0;background:color-mix(in srgb,var(--line) 34%,transparent)}
   .hline.hr{background:var(--line)}
   .anchorblk{position:absolute;z-index:1;left:1px;right:1px;border-radius:7px;background:repeating-linear-gradient(135deg,rgba(185,140,255,.12) 0 7px,rgba(185,140,255,.04) 7px 14px);border:1px dashed rgba(185,140,255,.4);pointer-events:none;overflow:hidden;padding:2px 6px}
+  .ext-ev{position:absolute;left:2px;right:2px;z-index:1;border-radius:8px;background:rgba(69,198,239,.1);border:1px dashed rgba(69,198,239,.5);pointer-events:none;overflow:hidden;padding:3px 7px;display:flex;align-items:flex-start;gap:5px}
+  .ext-ev .ext-tag{flex:0 0 auto;width:14px;height:14px;border-radius:4px;background:var(--dia);color:#04222f;font-size:9px;font-weight:800;display:grid;place-items:center;font-family:'Space Mono'}
+  .ext-ev .ext-t{font-size:10.5px;color:var(--dia);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .anchorblk span{font-size:9px;color:var(--purple);font-weight:700}
   .ev{position:absolute;z-index:2;border-radius:11px;
     background:linear-gradient(160deg, color-mix(in srgb, var(--c) 34%, var(--surface)), color-mix(in srgb, var(--c) 17%, var(--surface)));
@@ -450,9 +454,14 @@
         <button class="btn ghost sm block" onclick="triggerImport()">⬆️ Import backup</button>
       </div>
       <input type="file" id="importFile" accept="application/json" hidden onchange="importBackup(this)">
+      <button class="btn blue sm block" style="margin-top:10px" onclick="exportCalendar()">🗓️ Export calendar (.ics)</button>
+      <div class="wellsub" style="margin:8px 0 0;font-size:11px">One-time snapshot of your anchors (as repeating weekly events) and scheduled sessions — import the file into Google/Apple/Outlook Calendar. Re-export whenever your schedule changes; there's no live auto-sync since this app has no server.</div>
       <div id="installRow" style="margin-top:10px" hidden><button class="btn blue sm block" id="installBtn" onclick="promptInstall()">📲 Install Day Quest to home screen</button></div>
       <button class="btn bad sm block" style="margin-top:10px" onclick="resetAllData()">🗑️ Erase all data &amp; start over</button>
     </div>
+
+    <div class="eyebrow" style="margin-top:18px">Live calendar sync</div>
+    <div class="card" style="margin-bottom:12px" id="syncHost"></div>
   </section>
 
   <!-- COLLECTION -->
@@ -513,13 +522,249 @@ const DEFAULT_DB={
     {id:'r3',icon:'🎮',name:'New Steam game',cost:20,tier:'long',claimed:0},
     {id:'r4',icon:'🍽️',name:'Nice dinner / day trip',cost:40,tier:'long',claimed:0}
   ],
-  plan:{}, weeksGenerated:{}
+  plan:{}, weeksGenerated:{},
+  sync:{clientId:'',direction:'both',calendarId:'primary',lastSync:null,map:{}},
+  externalEvents:{}
 };
 let DB=load();
 function load(){ try{const r=localStorage.getItem('dayquest_v4'); if(r) return Object.assign(structuredClone(DEFAULT_DB),JSON.parse(r));}catch(e){} return structuredClone(DEFAULT_DB); }
 function save(){ try{localStorage.setItem('dayquest_v4',JSON.stringify(DB));}catch(e){} }
 
 /* ---- backup / export / import ---- */
+/* ---- calendar export (.ics) ---- */
+const ICS_DAYCODE=['SU','MO','TU','WE','TH','FR','SA'];
+function icsPad(n){return String(n).padStart(2,'0');}
+function icsStamp(dt){return dt.getUTCFullYear()+icsPad(dt.getUTCMonth()+1)+icsPad(dt.getUTCDate())+'T'+icsPad(dt.getUTCHours())+icsPad(dt.getUTCMinutes())+icsPad(dt.getUTCSeconds())+'Z';}
+function icsEsc(s){return String(s).replace(/\\/g,'\\\\').replace(/,/g,'\\,').replace(/;/g,'\\;').replace(/\n/g,'\\n');}
+function icsFold(line){ // RFC5545: lines >75 octets should be folded with a leading space
+  let out='',rest=line;
+  while(rest.length>74){ out+=rest.slice(0,74)+'\r\n '; rest=rest.slice(74); }
+  return out+rest;
+}
+function nextOccurrence(fromDate,dayIdx){const d=new Date(fromDate);const diff=(dayIdx-d.getDay()+7)%7;d.setDate(d.getDate()+diff);return d;}
+function buildICS(){
+  const now=new Date();
+  const lines=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//Day Quest//EN','CALSCALE:GREGORIAN'];
+  // Anchors -> recurring weekly events
+  (DB.anchors||[]).forEach(a=>{
+    if(!a.days||!a.days.length)return;
+    const firstDay=[...a.days].sort((x,y)=>x-y)[0];
+    const startDate=nextOccurrence(now,firstDay);
+    const [h,m]=a.start.split(':').map(Number);
+    const dtStart=new Date(startDate.getFullYear(),startDate.getMonth(),startDate.getDate(),h,m,0);
+    const dtEnd=new Date(dtStart.getTime()+a.mins*60000);
+    const byday=[...a.days].sort((x,y)=>x-y).map(d=>ICS_DAYCODE[d]).join(',');
+    lines.push('BEGIN:VEVENT');
+    lines.push('UID:anchor-'+a.id+'@day-quest');
+    lines.push('DTSTAMP:'+icsStamp(now));
+    lines.push('DTSTART:'+icsStamp(dtStart));
+    lines.push('DTEND:'+icsStamp(dtEnd));
+    lines.push(icsFold('RRULE:FREQ=WEEKLY;BYDAY='+byday));
+    lines.push(icsFold('SUMMARY:'+icsEsc(a.title)));
+    lines.push(icsFold('DESCRIPTION:'+icsEsc('Recurring commitment from Day Quest'+(a.type?' · '+a.type:''))));
+    lines.push('END:VEVENT');
+  });
+  // Scheduled items (quests + work blocks) currently on the calendar, today forward
+  const todayKey=dkey(today());
+  Object.keys(DB.plan||{}).filter(k=>k>=todayKey).sort().forEach(k=>{
+    (DB.plan[k]||[]).forEach(it=>{
+      const [y,mo,da]=k.split('-').map(Number);
+      const startMin=hhmmToMin(it.start);
+      const dtStart=new Date(y,mo-1,da,Math.floor(startMin/60),startMin%60,0);
+      const dtEnd=new Date(dtStart.getTime()+it.mins*60000);
+      lines.push('BEGIN:VEVENT');
+      lines.push('UID:item-'+it.id+'@day-quest');
+      lines.push('DTSTAMP:'+icsStamp(now));
+      lines.push('DTSTART:'+icsStamp(dtStart));
+      lines.push('DTEND:'+icsStamp(dtEnd));
+      lines.push(icsFold('SUMMARY:'+icsEsc(it.title+(it.done?' ✓':''))));
+      lines.push(icsFold('DESCRIPTION:'+icsEsc((it.type==='quest'?'Quest session':'Scheduled block')+' from Day Quest')));
+      lines.push('END:VEVENT');
+    });
+  });
+  lines.push('END:VCALENDAR');
+  return lines.join('\r\n');
+}
+function exportCalendar(){
+  const anchorCount=(DB.anchors||[]).length;
+  const todayKey=dkey(today());
+  const itemCount=Object.keys(DB.plan||{}).filter(k=>k>=todayKey).reduce((n,k)=>n+(DB.plan[k]||[]).length,0);
+  if(!anchorCount&&!itemCount){ toast('Nothing to export yet','Add an anchor or schedule something first'); return; }
+  const ics=buildICS();
+  const blob=new Blob([ics],{type:'text/calendar;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download='day-quest-calendar.ics';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+  toast('🗓️ Calendar file downloaded','Import it into Google/Apple/Outlook Calendar');
+}
+
+/* ================= LIVE GOOGLE CALENDAR SYNC ================= */
+// No backend exists (static hosting + localStorage), so this uses Google's browser-side
+// OAuth token flow: a short-lived access token lives only in memory (never persisted),
+// and reconnecting is needed each fresh app session. DB.sync stores prefs only, never the token.
+let gAccessToken=null, gTokenClient=null, gSyncing=false;
+
+function ensureGIS(){
+  return new Promise((resolve,reject)=>{
+    if(window.google&&google.accounts&&google.accounts.oauth2) return resolve();
+    let tries=0;
+    const iv=setInterval(()=>{
+      if(window.google&&google.accounts&&google.accounts.oauth2){clearInterval(iv);resolve();}
+      else if(++tries>60){clearInterval(iv);reject(new Error('Google sign-in script did not load'));}
+    },100);
+  });
+}
+function saveClientId(){
+  const v=document.getElementById('gClientId').value.trim();
+  DB.sync.clientId=v; save(); renderSyncUI();
+  toast(v?'Client ID saved':'Client ID cleared','');
+}
+async function connectCalendar(){
+  if(!DB.sync.clientId){ toast('Add your Google Client ID first',''); return; }
+  try{
+    await ensureGIS();
+    if(!gTokenClient){
+      gTokenClient=google.accounts.oauth2.initTokenClient({
+        client_id:DB.sync.clientId,
+        scope:'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly',
+        callback:(resp)=>{
+          if(resp.error){ toast('Google sign-in failed',resp.error); return; }
+          gAccessToken=resp.access_token;
+          renderSyncUI();
+          toast('🔗 Connected to Google Calendar','');
+          syncNow();
+        }
+      });
+    }
+    gTokenClient.requestAccessToken({prompt:gAccessToken?'':'consent'});
+  }catch(e){ toast('Could not load Google sign-in','Check your connection'); }
+}
+function disconnectCalendar(){ gAccessToken=null; renderSyncUI(); toast('Disconnected',''); }
+function setSyncDirection(dir){ DB.sync.direction=dir; save(); renderSyncUI(); if(gAccessToken) syncNow(); }
+
+async function gcalFetch(path,opts){
+  opts=opts||{};
+  const res=await fetch('https://www.googleapis.com/calendar/v3/calendars/'+encodeURIComponent(DB.sync.calendarId||'primary')+path,
+    Object.assign({},opts,{headers:Object.assign({Authorization:'Bearer '+gAccessToken,'Content-Type':'application/json'},opts.headers||{})}));
+  if(res.status===401){ gAccessToken=null; renderSyncUI(); throw new Error('Session expired — reconnect'); }
+  if(!res.ok) throw new Error('Google Calendar request failed ('+res.status+')');
+  return res.status===204?null:res.json();
+}
+
+function dqEventBody(title,dtStart,dtEnd,dqId,rrule,desc){
+  const body={summary:title,description:desc||'Synced from Day Quest',
+    start:{dateTime:dtStart.toISOString()},end:{dateTime:dtEnd.toISOString()},
+    extendedProperties:{private:{dqSource:'day-quest',dqId:String(dqId)}}};
+  if(rrule) body.recurrence=[rrule];
+  return body;
+}
+
+async function pushToCalendar(){
+  DB.sync.map=DB.sync.map||{};
+  // Anchors -> recurring events
+  for(const a of (DB.anchors||[])){
+    const key='anchor:'+a.id;
+    if(DB.sync.map[key])continue; // already pushed once; edit the anchor + clear map entry to re-push
+    const firstDay=[...a.days].sort((x,y)=>x-y)[0];
+    const startDate=nextOccurrence(new Date(),firstDay);
+    const [h,m]=a.start.split(':').map(Number);
+    const dtStart=new Date(startDate.getFullYear(),startDate.getMonth(),startDate.getDate(),h,m,0);
+    const dtEnd=new Date(dtStart.getTime()+a.mins*60000);
+    const byday=[...a.days].sort((x,y)=>x-y).map(d=>ICS_DAYCODE[d]).join(',');
+    const body=dqEventBody(a.title,dtStart,dtEnd,key,'RRULE:FREQ=WEEKLY;BYDAY='+byday,'Recurring commitment from Day Quest');
+    const created=await gcalFetch('/events',{method:'POST',body:JSON.stringify(body)});
+    DB.sync.map[key]=created.id; save();
+  }
+  // Scheduled items today forward -> single events
+  const todayKey=dkey(today());
+  const keys=Object.keys(DB.plan||{}).filter(k=>k>=todayKey).sort();
+  for(const k of keys){
+    for(const it of (DB.plan[k]||[])){
+      const key='item:'+it.id;
+      if(DB.sync.map[key])continue;
+      const [y,mo,da]=k.split('-').map(Number);
+      const startMin=hhmmToMin(it.start);
+      const dtStart=new Date(y,mo-1,da,Math.floor(startMin/60),startMin%60,0);
+      const dtEnd=new Date(dtStart.getTime()+it.mins*60000);
+      const body=dqEventBody(it.title,dtStart,dtEnd,key,null,(it.type==='quest'?'Quest session':'Scheduled block')+' from Day Quest');
+      const created=await gcalFetch('/events',{method:'POST',body:JSON.stringify(body)});
+      DB.sync.map[key]=created.id; save();
+    }
+  }
+}
+
+async function pullFromCalendar(){
+  const timeMin=new Date(); timeMin.setHours(0,0,0,0);
+  const timeMax=new Date(timeMin); timeMax.setDate(timeMax.getDate()+30);
+  const data=await gcalFetch('/events?timeMin='+encodeURIComponent(timeMin.toISOString())+'&timeMax='+encodeURIComponent(timeMax.toISOString())+'&singleEvents=true&orderBy=startTime&maxResults=250');
+  const fresh={};
+  (data.items||[]).forEach(ev=>{
+    const props=ev.extendedProperties&&ev.extendedProperties.private;
+    if(props&&props.dqSource==='day-quest')return; // our own pushed event — skip, avoids echo loop
+    if(!ev.start)return;
+    const allDay=!ev.start.dateTime;
+    const startDt=new Date(ev.start.dateTime||ev.start.date+'T00:00:00');
+    const endDt=ev.end?new Date(ev.end.dateTime||ev.end.date+'T00:00:00'):new Date(startDt.getTime()+3600000);
+    const k=dkey(startDt);
+    const mins=allDay?1439:Math.max(10,Math.round((endDt-startDt)/60000));
+    fresh[k]=fresh[k]||[];
+    fresh[k].push({id:'g_'+ev.id,title:ev.summary||'(untitled)',start:allDay?'00:00':minToHHMM(startDt.getHours()*60+startDt.getMinutes()),mins,allDay,source:'google'});
+  });
+  DB.externalEvents=fresh; save();
+}
+
+async function syncNow(){
+  if(!gAccessToken){ toast('Connect Google Calendar first',''); return; }
+  if(gSyncing)return; gSyncing=true; renderSyncUI();
+  try{
+    const dir=DB.sync.direction;
+    if(dir==='toCalendar'||dir==='both') await pushToCalendar();
+    if(dir==='toDayQuest'||dir==='both') await pullFromCalendar();
+    DB.sync.lastSync=new Date().toISOString(); save();
+    renderAll(); renderSyncUI();
+    toast('🔄 Calendar synced','');
+  }catch(e){ toast('Sync error',e.message||'Try reconnecting'); }
+  gSyncing=false; renderSyncUI();
+}
+function renderSyncUI(){
+  const host=document.getElementById('syncHost'); if(!host)return;
+  const s=DB.sync||{};
+  const connected=!!gAccessToken;
+  const last=s.lastSync?new Date(s.lastSync).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}):'never';
+  host.innerHTML=`
+    <div class="field" style="margin-bottom:10px"><label>Google Client ID</label>
+      <input type="text" id="gClientId" placeholder="xxxx.apps.googleusercontent.com" value="${esc(s.clientId||'')}"></div>
+    <button class="btn ghost sm block" style="margin-bottom:10px" onclick="saveClientId()">Save Client ID</button>
+    <button class="btn ${connected?'ghost':'blue'} sm block" onclick="${connected?'disconnectCalendar()':'connectCalendar()'}">${connected?'🔌 Disconnect':'🔗 Connect Google Calendar'}</button>
+    <details class="adder" style="margin-top:8px"><summary>How to set this up →</summary>
+      <div class="adderbox" style="gap:10px">
+        <div class="wellsub" style="margin:0">One-time setup, free, takes about 5 minutes. This connects <em>your own</em> Google account only — every person using this app needs to do their own connection, and everyone's calendar data stays private to them.</div>
+        <ol style="margin:0;padding-left:18px;font-size:12.5px;color:var(--text);line-height:1.85">
+          <li>Go to <b>console.cloud.google.com</b> and create a new project (any name works, e.g. "Day Quest").</li>
+          <li><b>APIs &amp; Services → Library</b> → search "Google Calendar API" → <b>Enable</b>.</li>
+          <li><b>APIs &amp; Services → OAuth consent screen</b> → choose External → fill in an app name and your email → add the Calendar scopes → under "Test users," add your own Google email → save. (Staying in Testing mode is fine — no Google review needed for personal use.)</li>
+          <li><b>APIs &amp; Services → Credentials → Create Credentials → OAuth Client ID</b> → Application type: <b>Web application</b>.</li>
+          <li>Under "Authorized JavaScript origins," add exactly: <span class="mono" style="color:var(--dia)">https://foodwise-hub.github.io</span></li>
+          <li>Copy the Client ID (ends in <span class="mono">.apps.googleusercontent.com</span>) and paste it above, tap <b>Save Client ID</b>, then <b>Connect</b>.</li>
+        </ol>
+        <div class="wellsub" style="margin:0">Sharing this app with others? They can each create their own Client ID the same way — or if you'd rather they ride on yours, add their Google email as a "Test user" on your OAuth consent screen (step 3). Either way, everyone only ever connects to their own calendar.</div>
+      </div>
+    </details>
+    <div class="wslot-t" style="margin:14px 0 8px">Sync direction</div>
+    <div class="restweeks" style="padding:0">
+      <button class="restbtn ${s.direction==='toDayQuest'?'on':''}" onclick="setSyncDirection('toDayQuest')">📥 Calendar → Day Quest</button>
+      <button class="restbtn ${s.direction==='both'?'on':''}" onclick="setSyncDirection('both')">🔁 Both ways</button>
+      <button class="restbtn ${s.direction==='toCalendar'?'on':''}" onclick="setSyncDirection('toCalendar')">📤 Day Quest → Calendar</button>
+    </div>
+    <div class="row" style="margin-top:12px;align-items:center">
+      <button class="btn green sm" style="flex:0 0 auto" ${connected&&!gSyncing?'':'disabled'} onclick="syncNow()">${gSyncing?'Syncing…':'🔄 Sync now'}</button>
+      <div class="psub" style="flex:1">Last synced: ${last}</div>
+    </div>
+    <div class="wellsub" style="margin-top:10px;font-size:11px">Since this app has no server, reconnect after closing the app for a while — each sync pulls the next 30 days and pushes anchors + upcoming sessions.</div>`;
+}
+
 function exportBackup(){
   const blob=new Blob([JSON.stringify({app:'day-quest',version:4,exportedAt:new Date().toISOString(),data:DB},null,2)],{type:'application/json'});
   const url=URL.createObjectURL(blob);
@@ -874,6 +1119,9 @@ function gridLines(){let s='';for(let m=0;m<1440;m+=15){s+=`<div class="hline${m
 function colInner(d){
   const k=dkey(d);let html=gridLines();
   anchorsForDate(d).forEach(a=>{const s=hhmmToMin(a.start);html+=`<div class="anchorblk" style="top:${minToPx(s)}px;height:${Math.max(minToPx(a.mins),16)}px"><span>${esc(a.title)}</span></div>`;});
+  (DB.externalEvents&&DB.externalEvents[k]||[]).forEach(ev=>{const s=hhmmToMin(ev.start);
+    html+=`<div class="ext-ev" style="top:${minToPx(s)+1.5}px;height:${Math.max(minToPx(ev.mins)-3,14)}px" title="From Google Calendar">
+      <span class="ext-tag">G</span><span class="ext-t">${esc(ev.title)}</span></div>`;});
   const evs=(DB.plan[k]||[]).map(it=>({it,_s:hhmmToMin(it.start),_e:hhmmToMin(it.start)+it.mins}));
   layout(evs);
   evs.forEach(ev=>{const it=ev.it;const q=it.type==='quest'?DB.quests.find(x=>x.id===it.questId):null;const color=q?q.color:(it.color||'#7fc4e0');
@@ -1102,6 +1350,7 @@ function delAnchor(id){DB.anchors=DB.anchors.filter(a=>a.id!==id);save();renderA
 function balFor(tier){return tier==='long'?(DB.diamonds||0):DB.coins;}
 function curIcon(tier){return tier==='long'?'💎':COIN_ICON;}
 function renderRewards(){
+  renderSyncUI();
   ['short','long'].forEach(tier=>{
     const el=document.getElementById(tier+'List');const list=DB.rewards.filter(r=>r.tier===tier);
     const bal=balFor(tier),ic=curIcon(tier);
