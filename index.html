@@ -134,6 +134,11 @@
   .ext-ev{position:absolute;left:2px;right:2px;z-index:1;border-radius:8px;background:rgba(69,198,239,.1);border:1px dashed rgba(69,198,239,.5);pointer-events:none;overflow:hidden;padding:3px 7px;display:flex;align-items:flex-start;gap:5px}
   .ext-ev .ext-tag{flex:0 0 auto;width:14px;height:14px;border-radius:4px;background:var(--dia);color:#04222f;font-size:9px;font-weight:800;display:grid;place-items:center;font-family:'Space Mono'}
   .ext-ev .ext-t{font-size:10.5px;color:var(--dia);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .calbanners{display:grid;border-bottom:1px solid var(--line);background:var(--surface)}
+  .bcol{display:flex;flex-direction:column;gap:2px;padding:3px 2px;border-left:1px solid var(--line)}
+  .ext-banner{border-radius:6px;background:rgba(69,198,239,.22);border:1px solid rgba(69,198,239,.6);overflow:hidden;padding:2px 6px;display:flex;align-items:center;gap:5px;height:17px}
+  .ext-banner .ext-tag{flex:0 0 auto;width:12px;height:12px;border-radius:3px;background:var(--dia);color:#04222f;font-size:8px;font-weight:800;display:grid;place-items:center;font-family:'Space Mono'}
+  .ext-banner .ext-t{font-size:10px;color:var(--dia);font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .anchorblk span{font-size:9px;color:var(--purple);font-weight:700}
   .ev{position:absolute;z-index:2;border-radius:11px;
     background:linear-gradient(160deg, color-mix(in srgb, var(--c) 34%, var(--surface)), color-mix(in srgb, var(--c) 17%, var(--surface)));
@@ -662,7 +667,7 @@ function dqEventBody(title,dtStart,dtEnd,dqId,rrule,desc){
 }
 
 async function pushToCalendar(){
-  DB.sync.map=DB.sync.map||{};
+  DB.sync.map=DB.sync.map||{}; let pushed=0;
   // Anchors -> recurring events
   for(const a of (DB.anchors||[])){
     const key='anchor:'+a.id;
@@ -675,7 +680,7 @@ async function pushToCalendar(){
     const byday=[...a.days].sort((x,y)=>x-y).map(d=>ICS_DAYCODE[d]).join(',');
     const body=dqEventBody(a.title,dtStart,dtEnd,key,'RRULE:FREQ=WEEKLY;BYDAY='+byday,'Recurring commitment from Day Quest');
     const created=await gcalFetch('/events',{method:'POST',body:JSON.stringify(body)});
-    DB.sync.map[key]=created.id; save();
+    DB.sync.map[key]=created.id; save(); pushed++;
   }
   // Scheduled items today forward -> single events
   const todayKey=dkey(today());
@@ -690,16 +695,17 @@ async function pushToCalendar(){
       const dtEnd=new Date(dtStart.getTime()+it.mins*60000);
       const body=dqEventBody(it.title,dtStart,dtEnd,key,null,(it.type==='quest'?'Quest session':'Scheduled block')+' from Day Quest');
       const created=await gcalFetch('/events',{method:'POST',body:JSON.stringify(body)});
-      DB.sync.map[key]=created.id; save();
+      DB.sync.map[key]=created.id; save(); pushed++;
     }
   }
+  return pushed;
 }
 
 async function pullFromCalendar(){
   const timeMin=new Date(); timeMin.setHours(0,0,0,0);
   const timeMax=new Date(timeMin); timeMax.setDate(timeMax.getDate()+30);
   const data=await gcalFetch('/events?timeMin='+encodeURIComponent(timeMin.toISOString())+'&timeMax='+encodeURIComponent(timeMax.toISOString())+'&singleEvents=true&orderBy=startTime&maxResults=250');
-  const fresh={};
+  const fresh={}; let pulled=0;
   (data.items||[]).forEach(ev=>{
     const props=ev.extendedProperties&&ev.extendedProperties.private;
     if(props&&props.dqSource==='day-quest')return; // our own pushed event — skip, avoids echo loop
@@ -707,12 +713,31 @@ async function pullFromCalendar(){
     const allDay=!ev.start.dateTime;
     const startDt=new Date(ev.start.dateTime||ev.start.date+'T00:00:00');
     const endDt=ev.end?new Date(ev.end.dateTime||ev.end.date+'T00:00:00'):new Date(startDt.getTime()+3600000);
-    const k=dkey(startDt);
-    const mins=allDay?1439:Math.max(10,Math.round((endDt-startDt)/60000));
-    fresh[k]=fresh[k]||[];
-    fresh[k].push({id:'g_'+ev.id,title:ev.summary||'(untitled)',start:allDay?'00:00':minToHHMM(startDt.getHours()*60+startDt.getMinutes()),mins,allDay,source:'google'});
+    const title=ev.summary||'(untitled)';
+    // Multi-day events (spans past midnight, or a true all-day event) render as a
+    // banner on every day they touch instead of one giant/hidden block on the start day.
+    const spansDays = allDay ? (dkey(endDt)!==dkey(startDt)) : ((endDt-startDt)>20*3600000 || dkey(endDt)!==dkey(startDt));
+    if(spansDays){
+      let cur=new Date(startDt.getFullYear(),startDt.getMonth(),startDt.getDate());
+      let last=new Date(endDt.getFullYear(),endDt.getMonth(),endDt.getDate());
+      if(allDay) last.setDate(last.getDate()-1); // all-day end dates are exclusive per spec
+      let guard=0;
+      while(cur<=last&&guard<21){
+        const dk=dkey(cur);
+        fresh[dk]=fresh[dk]||[];
+        fresh[dk].push({id:'g_'+ev.id+'_'+dk,title,start:'00:00',mins:0,banner:true,source:'google'});
+        cur.setDate(cur.getDate()+1); guard++;
+      }
+    } else {
+      const k=dkey(startDt);
+      const mins=Math.max(10,Math.round((endDt-startDt)/60000));
+      fresh[k]=fresh[k]||[];
+      fresh[k].push({id:'g_'+ev.id,title,start:minToHHMM(startDt.getHours()*60+startDt.getMinutes()),mins,banner:false,source:'google'});
+    }
+    pulled++;
   });
   DB.externalEvents=fresh; save();
+  return pulled;
 }
 
 async function syncNow(){
@@ -720,11 +745,15 @@ async function syncNow(){
   if(gSyncing)return; gSyncing=true; renderSyncUI();
   try{
     const dir=DB.sync.direction;
-    if(dir==='toCalendar'||dir==='both') await pushToCalendar();
-    if(dir==='toDayQuest'||dir==='both') await pullFromCalendar();
+    let pushed=0,pulled=0;
+    if(dir==='toCalendar'||dir==='both') pushed=await pushToCalendar();
+    if(dir==='toDayQuest'||dir==='both') pulled=await pullFromCalendar();
     DB.sync.lastSync=new Date().toISOString(); save();
     renderAll(); renderSyncUI();
-    toast('🔄 Calendar synced','');
+    const parts=[];
+    if(dir==='toCalendar'||dir==='both') parts.push('pushed '+pushed+' new');
+    if(dir==='toDayQuest'||dir==='both') parts.push('found '+pulled+' on your calendar');
+    toast('🔄 Synced',parts.join(' · '));
   }catch(e){ toast('Sync error',e.message||'Try reconnecting'); }
   gSyncing=false; renderSyncUI();
 }
@@ -1119,9 +1148,12 @@ function gridLines(){let s='';for(let m=0;m<1440;m+=15){s+=`<div class="hline${m
 function colInner(d){
   const k=dkey(d);let html=gridLines();
   anchorsForDate(d).forEach(a=>{const s=hhmmToMin(a.start);html+=`<div class="anchorblk" style="top:${minToPx(s)}px;height:${Math.max(minToPx(a.mins),16)}px"><span>${esc(a.title)}</span></div>`;});
-  (DB.externalEvents&&DB.externalEvents[k]||[]).forEach(ev=>{const s=hhmmToMin(ev.start);
+  (DB.externalEvents&&DB.externalEvents[k]||[]).forEach(ev=>{
+    if(ev.banner)return; // rendered in the sticky banner row above the grid instead
+    const s=hhmmToMin(ev.start);
     html+=`<div class="ext-ev" style="top:${minToPx(s)+1.5}px;height:${Math.max(minToPx(ev.mins)-3,14)}px" title="From Google Calendar">
-      <span class="ext-tag">G</span><span class="ext-t">${esc(ev.title)}</span></div>`;});
+      <span class="ext-tag">G</span><span class="ext-t">${esc(ev.title)}</span></div>`;
+  });
   const evs=(DB.plan[k]||[]).map(it=>({it,_s:hhmmToMin(it.start),_e:hhmmToMin(it.start)+it.mins}));
   layout(evs);
   evs.forEach(ev=>{const it=ev.it;const q=it.type==='quest'?DB.quests.find(x=>x.id===it.questId):null;const color=q?q.color:(it.color||'#7fc4e0');
@@ -1138,9 +1170,17 @@ function buildCal(mode,el){
   let head=`<div class="calhead" style="grid-template-columns:${tpl}"><div></div>`;
   dates.forEach(d=>{head+=`<div class="dh ${isToday(d)?'today':''}">${DOW[d.getDay()]}<b>${d.getDate()}</b></div>`;});
   head+='</div>';
+  const maxBanners=Math.max(0,...dates.map(d=>(DB.externalEvents&&DB.externalEvents[dkey(d)]||[]).filter(e=>e.banner).length));
+  let bannerRow='';
+  if(maxBanners>0){
+    bannerRow=`<div class="calbanners" style="grid-template-columns:${tpl}"><div></div>`;
+    dates.forEach(d=>{const bs=(DB.externalEvents&&DB.externalEvents[dkey(d)]||[]).filter(e=>e.banner);
+      bannerRow+=`<div class="bcol">${bs.map(b=>`<div class="ext-banner" title="From Google Calendar"><span class="ext-tag">G</span><span class="ext-t">${esc(b.title)}</span></div>`).join('')}</div>`;});
+    bannerRow+='</div>';
+  }
   let gutter='<div class="gutter">';for(let h=0;h<24;h++)gutter+=`<div class="hourlabel"><span>${h===0?'':String(h).padStart(2,'0')+':00'}</span></div>`;gutter+='</div>';
   let cols='';dates.forEach(d=>{cols+=`<div class="col" data-date="${dkey(d)}" style="height:${24*HOURPX}px">${colInner(d)}</div>`;});
-  el.innerHTML=head+`<div class="calbody"><div class="calgrid" style="grid-template-columns:${tpl}">${gutter}${cols}</div></div>`;
+  el.innerHTML=head+bannerRow+`<div class="calbody"><div class="calgrid" style="grid-template-columns:${tpl}">${gutter}${cols}</div></div>`;
   const body=el.querySelector('.calbody');if(body)body.scrollTop=(saved!=null)?saved:(7*HOURPX-10);
 }
 
